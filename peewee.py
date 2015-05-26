@@ -116,6 +116,7 @@ if PY3:
     basestring = str
     print_ = getattr(builtins, 'print')
     binary_construct = lambda s: bytes(s.encode('raw_unicode_escape'))
+
     def reraise(tp, value, tb=None):
         if value.__traceback__ is not tb:
             raise value.with_traceback(tb)
@@ -124,6 +125,7 @@ elif PY2:
     unicode_type = unicode
     string_type = basestring
     binary_construct = buffer
+
     def print_(s):
         sys.stdout.write(s)
         sys.stdout.write('\n')
@@ -748,6 +750,18 @@ class Field(Node):
         inst._is_bound = self._is_bound
         return inst
 
+    def _remonte_attribute(self, name):
+        for key, value in self.rel_model._meta.fields.items():
+            cvalue = deepcopy(value)
+            if isinstance(cvalue, (ForeignKeyField, ListField)) and issubclass(cvalue.rel_model, Model):
+                for k2 in cvalue.rel_model._meta.fields:
+                    if hasattr(cvalue, k2):
+                        v2 = getattr(cvalue, k2)
+                        if not isinstance(v2, (ForeignKeyField, ListField)):
+                            setattr(v2, 'recursive_name', '.'.join([name, v2.recursive_name]))
+            setattr(cvalue, 'recursive_name', name)
+            setattr(self, key, cvalue)
+
     def add_to_class(self, model_class, name):
         """
         Hook that replaces the `Field` attribute on a class with a named
@@ -1067,6 +1081,27 @@ class ReverseRelationDescriptor(object):
                 self.field == getattr(instance, self.field.to_field.name))
         return self
 
+
+class ListField(Field):
+    db_field = 'list'
+
+    def __init__(self, rel_model, *args, **kwargs):
+        if rel_model != 'self' and \
+                not issubclass(rel_model, Model) and \
+                not issubclass(rel_model, Field):
+            raise TypeError('Unexpected value for `rel_model`.  Expected '
+                            '`Model`, `Proxy` or "self"')
+        self.rel_model = rel_model
+        super(ListField, self).__init__(*args, **kwargs)
+
+    def add_to_class(self, model_class, name):
+        super(ListField, self).add_to_class(model_class, name)
+
+        if isinstance(self.rel_model, Model)\
+                or issubclass(self.rel_model, Model):
+            self._remonte_attribute(name)
+
+
 class ForeignKeyField(IntegerField):
     def __init__(self, rel_model, related_name=None, on_delete=None,
                  on_update=None, extra=None, to_field=None, *args, **kwargs):
@@ -1136,11 +1171,10 @@ class ForeignKeyField(IntegerField):
                          'model field of the same name.')
                 raise AttributeError(error % (
                     self.model_class._meta.name, self.name, self.related_name))
-            if self.related_name in self.rel_model._meta.reverse_rel:
-                error = ('Foreign key: %s.%s related name "%s" collision with '
-                         'foreign key using same related_name.')
-                raise AttributeError(error % (
-                    self.model_class._meta.name, self.name, self.related_name))
+            if self.related_name not in self.rel_model._meta.reverse_rel:
+                self.rel_model._meta.reverse_rel[self.related_name] = [self]
+            else:
+                self.rel_model._meta.reverse_rel[self.related_name].append(self)
 
         setattr(model_class, name, self._get_descriptor())
         setattr(self.rel_model,
@@ -1149,7 +1183,8 @@ class ForeignKeyField(IntegerField):
         self._is_bound = True
 
         model_class._meta.rel[self.name] = self
-        self.rel_model._meta.reverse_rel[self.related_name] = self
+
+        self._remonte_attribute(name)
 
     def get_db_field(self):
         """
